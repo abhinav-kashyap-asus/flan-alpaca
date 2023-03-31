@@ -21,6 +21,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from pytorch_lightning.loggers.wandb import WandbLogger
 from data_loading import TextToTextDataset
 import multiprocessing
+from torch.optim import AdamW
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -88,6 +89,7 @@ def init_args(raw_args):
     parser.add_argument("--use_gradient_checkpointing", action="store_true")
     parser.add_argument("--use_fsdp", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--optimizer", type=str, help="Optimizer to use")
     # Training args related to LoRA
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_r", type=int, default=8)
@@ -116,6 +118,7 @@ class LightningModel(pl.LightningModule):
                 r=self.hparams.lora_r,
                 lora_alpha=self.hparams.lora_alpha,
                 lora_dropout=self.hparams.lora_dropout,
+                target_modules=["q", "v"],
             )
             self.model = get_peft_model(self.model, peft_config)
             self.model.print_trainable_parameters()
@@ -183,11 +186,16 @@ class LightningModel(pl.LightningModule):
         ]
 
         # noinspection PyTypeChecker
-        optimizer = Adafactor(
-            optimizer_grouped_parameters,
-            lr=self.hparams.learning_rate,
-            relative_step=False,
-        )
+        if self.hparams.optimizer == "adamw":
+            optimizer = AdamW(
+                optimizer_grouped_parameters, lr=self.hparams.learning_rate
+            )
+        else:
+            optimizer = Adafactor(
+                optimizer_grouped_parameters,
+                lr=self.hparams.learning_rate,
+                relative_step=False,
+            )
         return [optimizer]
 
     def train_dataloader(self):
@@ -257,7 +265,7 @@ def main(raw_args=None):
         callbacks=[saver],
         overfit_batches=10 if args.debug else 0,
         devices=2,
-        log_every_n_steps=100,
+        log_every_n_steps=50,
     )
 
     trainer.fit(model)
