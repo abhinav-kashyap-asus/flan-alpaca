@@ -1,1 +1,5 @@
 /.idea/
+.envrc
+wandb
+data
+__pycache__

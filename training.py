@@ -17,8 +17,10 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Adafactor
 from transformers.models.t5.modeling_t5 import T5Block
-
+from peft import get_peft_model, LoraConfig, TaskType
+from pytorch_lightning.loggers.wandb import WandbLogger
 from data_loading import TextToTextDataset
+import multiprocessing
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -86,6 +88,11 @@ def init_args(raw_args):
     parser.add_argument("--use_gradient_checkpointing", action="store_true")
     parser.add_argument("--use_fsdp", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    # Training args related to LoRA
+    parser.add_argument("--use_lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
 
     args = parser.parse_args(raw_args)
     return args
@@ -100,6 +107,19 @@ class LightningModel(pl.LightningModule):
             self.hparams.model_name_or_path
         )
         print(dict(orig_state_dict=len(self.model.state_dict())))
+
+        # Get the lora model
+        if self.hparams.use_lora:
+            peft_config = LoraConfig(
+                task_type=TaskType.SEQ_2_SEQ_LM,
+                inference_mode=False,
+                r=self.hparams.lora_r,
+                lora_alpha=self.hparams.lora_alpha,
+                lora_dropout=self.hparams.lora_dropout,
+            )
+            self.model = get_peft_model(self.model, peft_config)
+            self.model.print_trainable_parameters()
+
         if self.hparams.use_compile:
             self.model = torch.compile(self.model)
         if self.hparams.use_gradient_checkpointing:
@@ -138,7 +158,14 @@ class LightningModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self._step(batch)
-        self.log("loss", loss, on_step=True, prog_bar=True, rank_zero_only=True)
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_epoch=True,
+            on_step=True,
+        )
         return loss
 
     def configure_optimizers(self):
@@ -176,6 +203,7 @@ class LightningModel(pl.LightningModule):
             batch_size=self.hparams.train_batch_size,
             drop_last=True,
             shuffle=True,
+            num_workers=multiprocessing.cpu_count(),
         )
 
 
@@ -209,8 +237,17 @@ def main(raw_args=None):
             cpu_offload=True,
         )
 
+    # Instantiate the loggers
+    import wandb
+
+    run_id = wandb.util.generate_id()
+    logger = WandbLogger(project="declare-lab-alpaca", id=run_id)
+
+    assert logger is not None
+
     trainer = pl.Trainer(
-        precision="bf16-mixed",
+        logger=logger,
+        precision=32,
         accelerator="gpu",
         strategy=strategy,
         accumulate_grad_batches=1 if args.debug else args.gradient_accumulation_steps,
@@ -218,8 +255,9 @@ def main(raw_args=None):
         gradient_clip_val=None if args.use_fsdp else 1.0,
         max_epochs=args.train_epochs,
         callbacks=[saver],
-        logger=False,
         overfit_batches=10 if args.debug else 0,
+        devices=2,
+        log_every_n_steps=100,
     )
 
     trainer.fit(model)
